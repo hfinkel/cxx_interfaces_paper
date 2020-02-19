@@ -1,0 +1,959 @@
+<pre class='metadata'>
+Title: Extending the Type System to Provide API and ABI Flexibility
+Shortname: D2123
+Revision: 0a
+Audience: EWGI
+Status: P
+Group: WG21
+URL: http://wg21.link/p2123
+Editor: Hal Finkel, Argonne National Laboratory, hfinkel@anl.gov
+Abstract: For C++, in some collective sense, our community wants the flexibility to change the implementation details and interfaces of types in order to realize performance benefits and otherwise enhance functionality while simultaneously wanting the interface stability necessary to compose software from compiled code created by multiple entities over long time spans. C++ does not currently provide the language-level tools necessary in order to express different points in this flexibility vs. stability space, and this makes it increasingly difficult to evolve the language and its standard library in useful directions. In this paper, we'll explore requirements and a potential solution to this problem.
+Date: 2020-02-15
+Markup Shorthands: markdown yes
+</pre>
+
+Introduction {#intro}
+===========
+
+The Application Binary Interface (ABI) in C++ is the architecture-specific protocol, including calling conventions and structure-layout rules, used on a system in order to support separate compilation of C++ code and the composition of programs from the output of those compilation tasks (often in the form of object files, static libraries, and/or shared libraries). In Prague, the committee considered the question of whether or not to take an "ABI break" for the C++23 revision of the standard. While the C++ specification does not specify an ABI, or ABI requirements, directly, our ability to evolve the standard requires consideration of ABI compatibility constraints imposed by the the design of existing shipping C++ ABIs. The results, unfortunately, we're fairly inconclusive. A reasonable interpretation of the poll results is that the committee is willing to consider an ABI break at some point in the future, but not right now, and that while performance is an important objective of C++, stability is also important. Moreover, it is unclear exactly what change to facts on the ground would lead to a consensus shift in this regard. This proposal seeks to change the facts on the ground by providing additional language facilities to manage interface stability, including between different revisions of the standard, over time.
+
+Would adopting this proposal essentially imply an ABI break? Yes an no. It's more complicated than that. By turning ABIs and interfaces into first-class facets of the language, code written may, by default, be ABI-incompaible with older C++ code. However, there's an explicit and natural way to use this older code (i.e., to explicitly have access to, and provide new functionality following, the older ABI). At this one transition point, it may be the case that wrapper code needs to be written in between C++20 and C++23 components to allow for the most-ergonomic usage, but that can be done completely within the context of standard C++, and the new language facilities prevent the needs for this wrapper creation to happen again in the future. In short, perhaps we can have our cake and eat it too.
+
+Note that there is a lot of prior work in this general area, both in the generalized C/C++ ecosystem, and in other programming languages. See, for example, Swift's module stability / library evolution model and Microsoft's Component Object Model (COM).
+
+Changelog {#chlog}
+===========
+
+ * r0: Initial version.
+
+
+Implementation {#impl}
+===========
+
+This proposal has not been implemented.
+
+Requirements {#req}
+===========
+
+ 1. C++ must default to providing flexibility over interface stability. If the programmer does nothing explicit, then they should get the highest possible performance (relative to that provided by other aspects of this proposal). This includes uses of standard-library types and functions.
+ 2. C++ must provide a way for types to provide interfaces that prioritize stability over flexibility. This must allow code written using a newer version of C++ to call functions in code written in an ABI-incompatible older version of C++, and code written in an older version of C++ to call functions in code written in an ABI-incompatible newer version of C++. It must be possible to implement this feature such that the ABI of pre-C++-23 code can be selected as required.
+ 3. This facility must be generalized, and not specific to different C++ versions. We recognize that the C++ standard library is not the only library with ABI concerns.
+ 4. This facility should work naturally with modules and should strive to not require viral annotations while retaining the ability to make expensive operations explicitly visible to readers of the code.
+
+This proposal certainly introduces new concepts (colloquial) into the C++ language, but aims to do so in a way that integrates naturally and provides behaviors akin to existing aspects of C++ functionality. It does this by:
+
+ 1. Fully integrating into the type system. This allows existing features such as template specialization and overloading to provide a lot of the necessary semantics.
+ 2. Fully integrating into C++'s name-lookup paradigm, thus making it easier to reason about how names work. 
+
+In addition, we recognize that we cannot predict the future, but we can require certain knowledge of the past, and so it must be the responsibility of new code to provide interfaces compatible with older users (and not the other way around).
+
+Differences From Existing Features {#diffex}
+===========
+
+Upon reading this proposal, you might object that what is being proposed here seems similar to a number of features that we already have in C++. We already have virtual functions, inline namespaces, and so on. Moreover, many of these features are used in practice specifically to support some of the use cases discussed here. Why do we need something new?
+
+Let's try to imagine the best that we could do with existing features if we wanted to update the standard library in a somewhat analogous way to what is effectively proposed here. First, like libc++ does, we would put all standard-library classes into an inline namespace. For future C++ revisions, implementations would make the namespace containing the previous implementation non-inline, and create a new inline namespace for the new versions of the standard library. This would enable simultaneous access to both the old and new standard library within the same application; technically speaking, changing the namespace definitions like this is an ODR violation, but a benign one in practice, and we could also make this okay with some kind of explicit wording. However, that doesn't address the problem of being able to write code that uses standard-library types on public library interfaces and have it be resilient to standard-library updates. In fact, if we just follow this inline-namespace approach, we've made the problem worse, by forcing all of these interfaces to explicitly traffic in C++-revision-specific standard-library types and, thus, add a lot of manual copying/conversion around all of this public-interface-using code.
+
+Our existing tool for addressing this next problem is to introduce a class hierarchy and make the public interface mostly, or entirely, virtual. If we had such a class hierarchy, we could use these types on public interfaces and, by doing so, gain resilience to functionality additions within the standard-library classes. However, we can't do this for many of the standard-library classes themselves, such as containers, as this would have serious negative performance implications: any time we had a pointer or reference to any of these types, the compiler needs to assume that it might be dealing with some derived class, and none of the functions would be inlined. Moreover, C++ doesn't have a way to say, "X is a pointer to some type T which has virtual functions, but I know the pointed-to object's type is exactly T and not some derived type." This all implies that our class hierarchy with virtual functions must be a separate hierarchy of wrapper types: A wrapper type for each C++23 standard-library class, a derived wrapper type for each C++26 standard-library class, and so on, with essentially all-virtual interfaces mirroring those of the types wrapped by each.
+
+This has a few problems. First, when using the wrapper types, the fact that all of the functions are virtual means that essentially nothing is inlined, and this leads to suboptimal performance. Also, standard-library types have plenty of templated member functions, and these can't be virtual regardless. In some sense, this implies a somewhat-better solution: Our class hierarchy of wrapper types become friends of the types they wrap, and the interface is the same as the wrapped class, except that virtual functions are used to access the type's data members.
+
+So this leaves us with a library design that looks something like this:
+
+<xmp>
+    #include <utility>
+
+    namespace std {
+    namespace cxx20 {
+
+    namespace interface {
+
+      template <typename T>
+      class thing;
+
+      template <typename T>
+      class thing_wrapper;
+
+    }
+
+    template <typename T>
+    class thing {
+    protected:
+      T x, y, z;
+
+      friend class interface::thing_wrapper<T>;
+
+    public:
+      thing(const T &x, const T &y, const T &z)
+        : x(x), y(y), z(z) { }
+
+      T sum() const {
+        return x + y + z;
+      }
+    };
+
+    namespace interface {
+
+      template <typename T>
+      class thing {
+      protected:
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_x() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_x() const = 0;
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_y() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_y() const = 0;
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_z() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_z() const = 0;
+
+      public:
+        T sum() const {
+          return get_x() + get_y() + get_z();
+        }
+
+        virtual operator cxx20::thing<T> &() = 0;
+        virtual operator const cxx20::thing<T> &() const = 0;
+      };
+
+      template <typename T>
+      class thing_wrapper : public thing<T> {
+        cxx20::thing<T> UO; // The underlying object.
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_x() { return UO.x; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_x() const { return UO.x; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_y() { return UO.y; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_y() const { return UO.y; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_z() { return UO.z; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_z() const { return UO.z; }
+
+      public:
+        thing_wrapper(const T &x, const T &y, const T &z)
+          : UO(x, y, z) { }
+
+        thing_wrapper(const cxx20::thing<T> &O) : UO(O) { }
+
+        thing_wrapper(cxx20::thing<T> &&O) : UO(std::move(O)) { }
+
+        virtual operator cxx20::thing<T> &() override { return UO; }
+        virtual operator const cxx20::thing<T> &() const override { return UO; }
+      };
+    }
+
+    } // namespace cxx20
+
+    inline namespace cxx23 {
+
+    namespace interface {
+      template <typename T>
+      class thing;
+
+      template <typename T>
+      class thing_wrapper;
+    }
+
+    template <typename T>
+    class thing {
+    protected:
+      T x, y, z, w;
+
+      friend class interface::thing_wrapper<T>;
+
+    public:
+      thing(const T &x, const T &y, const T &z, const T &w = T(0))
+        : x(x), y(y), z(z), w(w) { }
+
+      T sum() const {
+        return x + y + z + w;
+      }
+    };
+
+    namespace interface {
+
+      template <typename T>
+      class thing : public cxx20::interface::thing<T> {
+      protected:
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_w() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_w() const = 0;
+
+      public:
+        T sum() const {
+          return this->get_x() + this->get_y() + this->get_z() + get_w();
+        }
+
+        virtual operator cxx23::thing<T> &() = 0;
+        virtual operator const cxx23::thing<T> &() const = 0;
+      };
+
+      template <typename T>
+      class thing_wrapper : public thing<T> {
+      protected:
+        cxx23::thing<T> UO; // The underlying object.
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_x() { return UO.x; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_x() const override { return UO.x; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_y() { return UO.y; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_y() const override { return UO.y; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_z() { return UO.z; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_z() const override { return UO.z; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_w() override { return UO.w; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_w() const override { return UO.w; }
+
+      public:
+        thing_wrapper(const T &x, const T &y, const T &z, const T &w = T(0))
+          : UO(x, y, z, w) { }
+
+        thing_wrapper(const cxx23::thing<T> &O) : UO(O) { }
+
+        thing_wrapper(cxx23::thing<T> &&O) : UO(std::move(O)) { }
+
+        virtual operator cxx23::thing<T> &() override { return UO; }
+        virtual operator const cxx23::thing<T> &() const override { return UO; }
+      };
+
+    }
+
+    } // inline namespace cxx23
+    } // namespace std
+</xmp>
+
+Now you might object that some of the code duplication could be removed by using a CRTP approach and/or other refactoring, and that's likely correct. You might also object that, even if we had the "object_lifetime_invariant_reference" attribute to tell the optimizer that the function always returned a reference to the same object, that still wouldn't be optimal because it would be better to return object-lifetime-invariant object offsets instead, and that's also likely correct. One way or another, however, the code pattern needed here is both heavy on boilerplate and, even with that, performance suboptimal compared to what a compiler might be able to generate for a language feature with similar semantics.
+
+Most importantly, however, there's a design flaw in this library structure. Consider this function that someone may need to write:
+
+<xmp>
+void resilient_abi(cxx20::interface::thing<int> *);
+
+void call_resilient_abi(std::thing<int> *t) {
+  // Assuming for simplicity that we know that t is not nullptr...
+
+  // Should we use the copy or the move constructor of thing_wrapper here?
+  std::interface::thing_wrapper<int> *w = new std::interface::thing_wrapper<int>(*t);
+  resilient_abi(w);
+
+  // Hrmm... should I delete w now? Should I delete t?
+}
+</xmp>
+
+The problem here is that, if I'm wrapping an API that takes an object by pointer or reference, the relevant lifetime and ownership semantics of the pointer/reference parameters are unclear from the type system alone. The API usage here requires deep knowledge, and while in some sense this is okay (it is normally important to understand the behavior of the functions that you call), it also makes it more difficult to integrate use of these interfaces into large code bases. It's not possible for tooling to wrap interfaces like this in a generic way. What we really want is some way to tie the lifetime of w to the lifetime of t (in the example above), and we don't have any way to do that within this wrapper function.
+
+A solution to this problem is clear, but unfortunate in it's own ways. We cannot make the underlying types unconditionally have the virtual functions because that would both unconditionally increase the object size (which breaks one of our requirements), and because it's then not possible to provide both the member functions that use of the virtual data-member access and those that don't (with the same names). An alternative is to create two different variants of each type, one normal one, and one also holds a wrapper object of itself. We can make an interface like this:
+
+<xmp>
+    namespace std {
+    namespace cxx20 {
+
+    namespace interface {
+
+      template <typename T>
+      class thing;
+
+      template <typename T>
+      class thing_wrapper;
+
+    }
+
+    template <typename T>
+    class thing_unwrappable {
+    protected:
+      T x, y, z;
+
+      friend class interface::thing_wrapper<T>;
+
+    public:
+      thing_unwrappable(const T &x, const T &y, const T &z)
+        : x(x), y(y), z(z) { }
+
+      T sum() const {
+        return x + y + z;
+      }
+    };
+
+    template <typename T>
+    class thing : public thing_unwrappable<T> {
+    protected:
+      interface::thing_wrapper<T> *wpr;
+
+    public:
+      thing(const T &x, const T &y, const T &z);
+      thing(const thing &P);
+      interface::thing_wrapper<T> *wrapper() const { return wpr; }
+      ~thing() { delete wpr; }
+    };
+
+    namespace interface {
+
+      template <typename T>
+      class thing {
+      protected:
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_x() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_x() const = 0;
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_y() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_y() const = 0;
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_z() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_z() const = 0;
+
+      public:
+        virtual ~thing() { }
+
+        T sum() const {
+          return get_x() + get_y() + get_z();
+        }
+
+        virtual operator cxx20::thing<T> &() = 0;
+        virtual operator const cxx20::thing<T> &() const = 0;
+      };
+
+      template <typename T>
+      class thing_wrapper : public thing<T> {
+        cxx20::thing<T> *UO; // The underlying object.
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_x() { return UO->x; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_x() const { return UO->x; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_y() { return UO->y; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_y() const { return UO->y; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_z() { return UO->z; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_z() const { return UO->z; }
+
+      public:
+        ~thing_wrapper() {
+          if (UO) {
+            UO->release_wrapper();
+            delete UO;
+          }
+        }
+
+        thing_wrapper(const cxx20::thing<T> *O) : UO(O) { }
+
+        virtual operator cxx20::thing<T> &() override { return *UO; }
+        virtual operator const cxx20::thing<T> &() const override { return *UO; }
+      };
+    } // namespace interface
+
+    template <typename T>
+    thing<T>::thing(const T &x, const T &y, const T &z)
+        : thing_unwrappable<T>(x, y, z),
+          wpr(new interface::thing_wrapper<T>(this)) { }
+    template <typename T>
+    thing<T>::thing(const thing &P)
+      : thing_unwrappable<T>(P),
+        wpr(new interface::thing_wrapper<T>(this)) { }
+
+    } // namespace cxx20
+
+    inline namespace cxx23 {
+
+    namespace interface {
+      template <typename T>
+      class thing;
+
+      template <typename T>
+      class thing_wrapper;
+    }
+
+    template <typename T>
+    class thing_unwrappable {
+    protected:
+      T x, y, z, w;
+
+      friend class interface::thing_wrapper<T>;
+
+    public:
+      thing_unwrappable(const T &x, const T &y, const T &z, const T &w = T(0))
+        : x(x), y(y), z(z), w(w) { }
+
+      T sum() const {
+        return x + y + z + w;
+      }
+    };
+
+    template <typename T>
+    class thing : public thing_unwrappable<T> {
+    protected:
+      interface::thing_wrapper<T> *wpr;
+
+    public:
+      thing(const T &x, const T &y, const T &z, const T &w = T(0));
+      thing(const thing &P);
+      interface::thing_wrapper<T> *wrapper() const { return wpr; }
+      ~thing() { delete wpr; }
+    };
+
+    namespace interface {
+
+      template <typename T>
+      class thing : public cxx20::interface::thing<T> {
+      protected:
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_w() = 0;
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_w() const = 0;
+
+      public:
+        T sum() const {
+          return this->get_x() + this->get_y() + this->get_z() + get_w();
+        }
+
+        virtual operator cxx23::thing<T> &() = 0;
+        virtual operator const cxx23::thing<T> &() const = 0;
+      };
+
+      template <typename T>
+      class thing_wrapper : public thing<T> {
+      protected:
+        cxx23::thing<T> UO; // The underlying object.
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_x() { return UO->x; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_x() const override { return UO->x; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_y() { return UO->y; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_y() const override { return UO->y; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_z() { return UO->z; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_z() const override { return UO->z; }
+
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual T& get_w() override { return UO->w; }
+        /*[[object_lifetime_invariant_reference]]*/
+        virtual const T& get_w() const override { return UO->w; }
+
+      public:
+        ~thing_wrapper() {
+          if (UO) {
+            UO->release_wrapper();
+            delete UO;
+          }
+        }
+
+        thing_wrapper(const cxx23::thing<T> *O) : UO(O) { }
+
+        virtual operator cxx23::thing<T> &() override { return *UO; }
+        virtual operator const cxx23::thing<T> &() const override { return *UO; }
+      };
+
+    } // namespace interface
+
+    template <typename T>
+    thing<T>::thing(const T &x, const T &y, const T &z, const T &w)
+        : thing_unwrappable<T>(x, y, z, w),
+          wpr(new interface::thing_wrapper<T>(this)) { }
+    template <typename T>
+    thing<T>::thing(const thing &P)
+      : thing_unwrappable<T>(P),
+        wpr(new interface::thing_wrapper<T>(this)) { }
+
+    } // inline namespace cxx23
+    } // namespace std
+</xmp>
+
+And, now, the user can choose std::thing, or std::thing_unwrappable, depending on whether or not the user wants to use the type with the ABI-resilient interfaces (which use the wrapper types). The public library interfaces across which we need to be resilient to ABI changes, we can use the wrapper types. The lifetime of the wrapper object is now tied to that of the underlying object. However, because we need to be able to use the delete operator with the wrappers and have that delete the underlying object (and also delete the underlying object and have it delete the wrapper), we're stuck needing two independent objects with dynamic allocation and pointers that would not be necessary if the wrapper were a proper subobject of the object being wrapped.
+
+To goal of this proposal is to give us the benefit of this kind of library structure, but without needing separate object allocations, and without the boilerplate and related usage complexity.
+
+With this proposal, the above library type looks like this:
+
+<xmp>
+namespace std {
+  interface cxx20("506b620f-e233-4359-a4d3-57c9311e9206");
+  interface cxx23("3fae4804-279c-4c8f-8bdf-4ad0dde2e587") : cxx20;
+
+  template <typename T>
+  class point {
+    interface(cxx20) {
+      T x, y, z;
+    }
+
+    interface(cxx23) T w;
+
+  public:
+    interface(cxx20) {
+      point(const T &x, const T &y, const T &z)
+        : x(x), y(y), z(z) { }
+
+      T sum() const {
+        return x + y + z;
+      }
+    }
+
+    interface(cxx23) {
+      point(const T &x, const T &y, const T &z, const T &w = T(0)) 
+        : x(x), y(y), z(z), w(w) { }
+
+      T sum() const {
+        return x + y + z + w;
+      }
+    }
+  };
+} // namespace std
+</xmp>
+
+Now we can use the type in a variety of ways:
+
+<xmp>
+// A pointer to: interface(<implementation-defined-default>) std::point<int>.
+std::point<int> *x;
+
+// Same as above.
+interface() std::point<int> *x;
+
+// A pointer to: The C++20 std::point<int>.
+interface(std::cxx20) std::point<int> *x;
+
+// A pointer to: The C++23 std::point<int>.
+// This is usable with an interface taking the C++23-or-later type below.
+// The object itself might be a little larger than necessary,
+// but should not otherwise have other performance overhead.
+interface(std::cxx23) std::point<int> *x;
+
+// A pointer to: The C++23 or later std::point<int>.
+// Use of this object will involve some indirect-access overheads.
+interface(std::cxx23+) std::point<int> *x;
+
+// A pointer to: interface(<implementation-defined-default>=) std::point<int>.
+// This is *not* usage with an interface taking the C++23-or-later type.
+interface(=) std::point<int> *x;
+
+// A pointer to: The C++23 std::point<int> type (without any extra metadata).
+// This is *not* usage with an interface taking the C++23-or-later type.
+interface(std::cxx23=) std::point<int> *x;
+</xmp>
+
+How Do I? {#hdi}
+=======
+
+In this section, we'll walk though a number of use cases and discuss how they'll work with this proposal...
+
+ * I have code compiled for C++20 that uses modules. How can I use it in C++23 code?
+
+<xmp>
+import SomeCXX20Code;
+// Now use the exported things as you would expect.
+</xmp>
+
+The implementation is allowed to automatically assign the cxx20 interface tag to all of the things in the module (and although the standard may not be able to mandate it, it should do so).
+
+ * I have code compiled for C++20 that does not use modules. How can I use it in C++23 code?
+
+<xmp>
+#include <stdinterface>
+interface(std::cxx20) {
+#include <SomeCXX20Code.h>
+}
+// Now use the included things as you would expect.
+</xmp>
+
+The interface block will implicitly assign the cxx20 interface tag to everything in the included file, and since nothing in that code uses interfaces, everything should work naturally.
+
+ * Okay, it can't be that simple. What's the catch?
+
+The catch is that types from the standard library that are used with that code are not the same types as the standard-library types used in the rest of your C++23 code. So this won't work...
+
+<xmp>
+#include <stdinterface>
+interface(std::cxx20) {
+void foo(std::vector<int> &v);
+}
+...
+std::vector<int> v;
+foo(v); // illformed; no conversion
+        // from std::cxx23::vector<int>& to std::cxx20::vector<int>&
+</xmp>
+
+But the point here is that:
+
+ 1. Both the C++20 and C++23 types can simultaneously coexist in your program (they're different types in every respect - no ODR or linking problems). So you might need to make copies on interfaces here, but this is all well-defined C++ code and the programmers can figure out the best way to handle this for their applications.
+ 2. This is a one-time transition, and in the future we can use better facilities provided to manage these kinds of transitions.
+
+Note that saying that we can use better facilities in the future does imply that relevant standard library types will, by default, be slightly larger in the future (e.g., one sizeof(void*) larger). Sorry, no completely-free lunch. On the other hand, exactly how many pointers are in std::vector or std::map or whatever itself is not normally the determining factor for overall performance. If this is critical for you, see the next question...
+
+ * I need absolutely no extra overhead in my use of standard-library containers (not even one extra internal pointer) compared to C++20. How can I get that?
+
+<xmp>
+#include <stdinterface>
+...
+// This vector can pass though unresolved interfaces that are
+// resilient to API/ABI changes.
+std::vector<int> x;
+
+interface(std::cxx23+) std::vector<int> &r = x; // okay
+
+// This vector can't do so, but sizeof(y) may be smaller than sizeof(x).
+interface() std::vector<int> y;
+
+interface(std::cxx23+) std::vector<int> &r = y; // illformed
+</xmp>
+
+ * Given that C++20 and C++23 standard-library types are different types, can I provide different function overloads for them?
+
+Yes, they're different types. That means that you can provide different overloads for them, different template specializations for them, and so on.
+
+<xmp>
+#include <stdinterface>
+...
+void foo(interface(std::cxx20) std::vector<int> &x) { ... }
+void foo(interface(std::cxx23) std::vector<int> &y) { ... }
+</xmp>
+
+but to be resilient against future changes, you might write:
+
+<xmp>
+#include <stdinterface>
+...
+void foo(interface(std::cxx20) std::vector<int> &x) { ... }
+void foo(interface(std::cxx23+) std::vector<int> &y) { ... }
+</xmp>
+
+and now the second overload will handle all versions of the standard in the future. There will be some performance overhead as we've now essentially made all member functions on y virtual, although the compiler is certainly free to specialize for the case where the object is of type std::cxx23::vector itself - and the programmer can also explicitly specialize by using dynamic_cast in the definition of the function (although I wouldn't recommend it, unless the programmer also arranges for some way to test the non-specialized code).
+
+Template instantiation and specialization also work as they usually do:
+
+<xmp>
+template <typename T>
+unsigned foo() { return sizeof(T); }
+...
+// This returns whatever it did in C++20 for std::vector<int>, probably 24.
+foo<interface(std::cxx20) std::vector<int>>();
+
+// This returns whatever it should now in C++23, maybe 32.
+foo<interface(std::cxx23) std::vector<int>>();
+foo<std::vector<int>>(); // if cxx23 is the default, this is the same as above.
+
+// Maybe this is back to returning 24.
+foo<interface() std::vector<int>>();
+
+foo<interface(std::cxx23+) std::vector<int>>(); // illformed, not a pointer/reference.
+</xmp>
+
+Note: On the design space here: it is tempting to think of objects with unresolved interface tags as real (complete) "proxy objects" with sizes and so on. There are several alternatives here that don't really work. First, we could have proxy objects as real objects that are first-class values. The problem here comes from functions that want the proxy itself by pointer, as automatic wrapping would require heap allocating the proxy, and then it would need to live for an indefinite period of time (its lifetime should be tied to that of the original object, but we have no good way to do that). An alternative would be to make the user explicitly manage the lifetime of the proxy object, but the ergonomics are not good (and the user of the interface in question might also not own the object or have any way to tie the lifetime of the newly-allocated proxy object to the original). We could say that, somewhat like references, taking the address of the proxy object yields the underlying object, so we never pass pointers to the proxy objects (they're only used for pass by value), but then the size of the proxy object would be inconsistent with the size of the storage represented by the memory at the taken address.
+
+ * How can the standard library write a class that provides it's existing external interface to C++20 clients, and a new interface to C++23 clients?
+
+<xmp>
+#include <stdinterface>
+...
+struct point {
+  interface(std::cxx20) {
+    int x, y, z;
+    interface(std::cxx23) int w;
+
+    int get_x() const { return x; }
+
+    int get_w() const interface(std::cxx23) { return w; }
+
+    interface(std::cxx23) {
+      bool only_for_cxx23() { return true; }
+    }
+  }
+};
+
+// sizeof(interface(std::cxx20) point) == 12.
+// sizeof(interface(std::cxx23) point) == 16;
+</xmp>
+
+This class provides an existing interface to C++20 clients, using its exiting ABI, while simultaneously providing an expanded interface to C++23 clients.
+
+Note that you can't do this:
+
+<xmp>
+struct thing {
+  interface(std::cxx20) {
+    void action(interface(std::cxx23) std::vector<int> &x) { } // illformed.
+    // The function of the older interface cannot take
+    // parameters (or return) types with the newer interface.
+  }
+};
+</xmp>
+
+ * How can I (not the standard library) write a class that provides it's existing external interface to C++20 clients, and a new interface to C++23 clients?
+
+You do this in much the same way as the standard library, but you only need to consider cxx20 to be special as far as the ABI goes. Going forward, you likely want to decouple your interface updating strategy from that of the C++ standard.
+
+<xmp>
+#include <stdinterface>
+...
+interface v2("31f6f8ca-401a-4ddf-b6ee-2460bb3d4a3b") : std::cxx20;
+interface v3("04d10740-c706-44f5-90d3-541f52e25af8") : v2;
+...
+struct point {
+  interface(std::cxx20) {
+    int x, y, z;
+    interface(v2) int w;
+
+    int get_x() const { return x; }
+
+    int get_w() const interface(v2) { return w; }
+
+    interface(v3) {
+      bool only_for_v3() { return true; }
+    }
+  }
+};
+
+// sizeof(interface(std::cxx20) point) == 12.
+// sizeof(interface(v2) point) == 16;
+// sizeof(interface(v3) point) == 16;
+</xmp>
+
+ * What if I don't care about C++20 ABI compatibility, and I just want to manage by interface stability going forward?
+
+In that case, you can ignore the standard tags and just add interface declarations as appropriate.
+
+<xmp>
+interface v1("31f6f8ca-401a-4ddf-b6ee-2460bb3d4a3b");
+interface v2("04d10740-c706-44f5-90d3-541f52e25af8") : v1;
+...
+struct point {
+  interface(v1) {
+    int x, y, z;
+    interface(v2) int w;
+
+    int get_x() const { return x; }
+
+    int get_w() const interface(v2) { return w; }
+
+    interface(v3) {
+      bool only_for_v3() { return true; }
+    }
+  }
+};
+
+// sizeof(interface(v1) point) == 12.
+// sizeof(interface(v2) point) == 16;
+// sizeof(interface(v3) point) == 16;
+</xmp>
+
+ * What if I'm writing a function that takes standard-library types as parameters, and it might be called by clients using current and future revisions of C++?
+
+Then you'll want to take these unresolved-interface-qualified types.
+
+<xmp>
+void foo(interface(std::cxx23+) std::vector<int> &x) interface(std::cxx23) {
+ // We can be called with a C++23 vector, or a C++26 vector, or any later version.
+}
+</xmp>
+
+Note that there's a significant difference is design intent here....
+
+
+
+Now here's the interesting case...
+
+<xmp>
+struct thing {
+  interface(std::cxx
+}
+
+interface(std::cxx23) {
+  struct 
+}
+</xmp>
+
+Proposal {#prop}
+===========
+
+## Interface Tags ## {#itags}
+
+First, this proposal introduces the concept of an interface tag. An interface tag identifies an interface version and has two properties:
+
+ 1. A name. This name has the usual properties of names in C++: it has a scope, it may be qualified, and so on.
+ 2. A unique identifier. This is specified as a string specifying a UUID.
+
+In addition, an interface may specify an interface from which it inherits. Only single inheritance is permitted (i.e., interface versions have only a linear history).
+
+While an interface has a name, and that name is used during name lookup, an interface is identified only by its UUID. This means that it's perfectly legal for multiple interfaces (with different names) to have the same UUID. When performing name lookup, interfaces with the same UUID are considered the same.
+
+Note: This is to allow users to change the names used for interface tags over time.
+
+<xmp>
+// Declares an interface tag:
+interface v1("31f6f8ca-401a-4ddf-b6ee-2460bb3d4a3b");
+// Declares an interface tag that inherits from the one above.
+interface v2("04d10740-c706-44f5-90d3-541f52e25af8") : v1;
+</xmp>
+
+The intent of this proposal is that each version of the standard will define an interface tag associated with that version of the standard, along with the tags defined in previous revisions of the standard, with an appropriate inheritance structure. For example, we might have:
+
+<xmp>
+interface cxx20("506b620f-e233-4359-a4d3-57c9311e9206");
+interface cxx23("3fae4804-279c-4c8f-8bdf-4ad0dde2e587") : cxx20;
+</xmp>
+
+Issue: The UUID is a specification of a 128-bit unsigned integer, and other ways to write an 128-bit integer constant might also be permitted.
+
+Note: It is expected that implementations will treat the cxx20 tag as a special case for the purpose of maintaining ABI compatibility with code compiled using tools complying with previous revisions of the C++ standard.
+
+Issue: Can interfaces themselves be template arguments and, thus, be dependent? Can the UUID used in the declaration be dependent or constexpr computed? 
+
+## Interface Blocks ## {#blks}
+
+Recognizing that it is often the case that an interface will apply to everything in large sections of source code, this proposal introduces interface blocks. An interface block can appear at any scope (i.e., namespace scope, class scope, function-scope, etc.) and only cause all declarations and definitions within the interface block to have an implicit interface qualifier with the provided interface tag.
+
+<xmp>
+namespace foo {
+  interface(v1) {
+    struct x;
+  }
+
+  interface(v2) {
+    struct y;
+    struct x : public y;
+  }
+
+  struct z {
+    interface(v1) {
+      int x;
+    }
+
+    interface(v2) {
+      int x;
+      int y;
+    }
+  };
+}
+</xmp>
+
+Note: Formally, interface blocks do not introduce new scopes, but are merely syntactic sugar for adding the interface qualifier to everything relevant inside the curly braces. This might seem strange, but in context this makes sense because the interface qualifier itself has a name-scoping effect, and so from the programmer's perspective, the construct should have the behavior implied by the braces.
+
+An interface block with an "default" interface restores use of the default interface.
+
+## Interface Qualifiers ## {#quals}
+
+This proposal introduces a new interface qualifier. There are two kinds of interface qualifiers for:
+
+ 1. Resolved interfaces - These refer to a specific, named interface.
+ 2. Unresolved interfaces - These refer to a named base interface, and the object might have that interface or any interface (transitively) inheriting from it.
+
+<xmp>
+// A qualifier for the interface tag v1.
+interface(v1)
+// A qualifier for the interface tag v1 or any interface inheriting from it.
+// This is called an unresolved interface.
+interface(v1+)
+</xmp>
+
+These qualifiers can appear on functions, variables, and so on. Interface qualifiers have a dual affect:
+
+ 1. They become part of the type. This has all of the usual properties (e.g., they can be used for overloading, template specialization, and so on).
+ 2. They become part of the name of the declared entities. This works in much the same way as inline namespaces, where a namespace with the name of the interface tag encloses the declared entity. Thus, the interface tag is used as a kind of namespace name, but the name also becomes available in the enclosing scope.
+
+Note: Because interface names, when appearing in qualified names, are compared by UUID and not by name, there are aspects that depart from usual namespace names, but the effect should be largely familiar to programmers.
+
+Note: It is expected that implementations will use the UUID of the interface when performing name mangling instead of the name used for any associated interface tag (except for the special cxx20 tag, which is likely has it's own legacy mangling scheme).
+
+Note: Unresolved interface names are not available as identifiers that can be used to form qualified names. This should be okay because the reason one might use the interface tag as part of a qualified name is to refer to some specific entity, but unresolved interfaces don't contain specific entities.
+
+There is an implementation-defined default interface tag applied to all declarations and definitions. This default must be the same for all entities within a module.
+
+Note: This is to allow the implementation to import modules previously compiled under previous revisions of the C++ standard and have entities in those modules have the "older" interface tag.
+
+An interface qualifier with an "default" interface tag specifies that the default interface is to be used.
+
+When performing name lookup, there might be multiple available names in a scope that only differ by their interface tag. In this case, names with an interface tag matching those of the object (for member access), or parameters (analogous to ADL) for any calls, are preferred.
+
+### Interface Additivity ### {#qualsadd}
+
+Entities cannot have more than one interface, although if an entity has an interface qualifier (explicit or implicit) for both an interface and an interface from which it inherits, the parent interface qualifier is ignored. Otherwise, the program is illformed.
+
+Members of an aggregate must all have interfaces with a common base interface, otherwise the program is illformed.
+
+The set of interface-visible, qualified names associated with an interface tag, including any explicitly-deleted names, must be a superset of the names associated with the tag from which it inherits. Otherwise, the program is illformed. Interface-visible names are those which are namespace scope, public, or used (even in an unevaluated context) by interface-visible entities with inline linkage.
+
+Entities within the same scope with the same name and type (ignoring interface tags) that have storage must be aliases to the same object (i.e., must share that storage).
+
+Note: The above rules are intended to ensure that interface inheritance is strictly additive (although additive in this context does include the ability to explicitly make names unavailable by deleting them) and storage sharing takes place as needed.
+
+Interface qualifiers on fundamental types are ignored. The implementation may define extended fundamental types on which interface qualifiers are ignored. Collectively, these are called interface oblivious types. The standard library shall provide a type trait that can be used to determine if interface qualifiers will be ignored for a given base type.
+
+### Unresolved Interfaces ### {#qualsur}
+
+Types with unresolved interfaces are distinct from types with resolved interfaces to the same base interface tags.
+
+Note: dynamic_cast, and other associated mechanisms, can be used to determine if an object with a given type can be converted to another type (perhaps differing only in the interface qualifier).
+
+Variables with types with unresolved interfaces may hold values of the same base type and any interface tag that (transitively) inherits from the provided base interface or the base interface itself. This requires, however, that the type has an interface tag that has been explicitly provided and not empty (either via a qualifier or an interface block, not just by the "default" interface tag or otherwise by the implementation default).
+
+Note: The restriction to types with explicitly-provided interface tags is needed to permit types to omit their hidden metadata fields associated with providing interface support.
+
+offsetof cannot be applied to types with unresolved interfaces, and neither can sizeof/alignof. These can only be used to make pointer/reference types.
+
+Note: The offsets of members within a type with an unresolved interface are not available at compile time, and can be different for different values.
+
+Whether or not the unresolved interface type cxx20+ can be used is implementation defined. All other interface tags defined by the standard (e.g., cxx23) and all other user-declared interface tags must be supported as the base for unresolved interfaces.
+
+Note: The fact that cxx20+ might not be supported reflects the fact that these objects follow an older, potentially-incompatible ABI.
+
+All interface-public members can be accessed from a type with an unresolved interface, but all types on those interfaces will be act as though they're also unresolved. If any of these types do not support use with unresolved interfaces, the program is illformed.
+
+## Header &lt;stdinterface&gt; ## {#hdr}
+
+<xmp>
+namespace std {
+  interface cxx20("506b620f-e233-4359-a4d3-57c9311e9206");
+  interface cxx23("3fae4804-279c-4c8f-8bdf-4ad0dde2e587") : cxx20;
+
+
+  template<class T>
+  struct is_interface_oblivious;
+
+  template<class T>
+  inline constexpr bool is_interface_oblivious_v = is_interface_oblivious<T>::value;
+}
+</xmp>
+
+is_interface_oblivious can be used to detect if the type is interface oblivious (i.e., ignores interface qualifiers). This is true for fundamental types and may also be true for an implementation-defined set of other implementation-defined types. Otherwise, it is false.
+
+Issue: Other traits should be provided. A traits to strip off the interface qualifier seems likely needed.
+
+Acknowledgments {#ack}
+=======
+
+This research was supported by the Exascale Computing Project (17-SC-20-SC), a collaborative effort of two U.S. Department of Energy organizations (Office of Science and the National Nuclear Security Administration) responsible for the planning and preparation of a capable exascale ecosystem, including software, applications, hardware, advanced system engineering, and early testbed platforms, in support of the nation's exascale computing imperative. Additionally, this research used resources of the Argonne Leadership Computing Facility, which is a DOE Office of Science User Facility supported under Contract DE-AC02-06CH11357.
+
