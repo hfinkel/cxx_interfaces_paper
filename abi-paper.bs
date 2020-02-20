@@ -502,8 +502,8 @@ With this proposal, the above library type looks like this:
 
 <xmp>
 namespace std {
-  interface cxx20("506b620f-e233-4359-a4d3-57c9311e9206");
-  interface cxx23("3fae4804-279c-4c8f-8bdf-4ad0dde2e587") : cxx20;
+  interface cxx20;
+  interface cxx23 : cxx20;
 
   template <typename T>
   class point {
@@ -594,7 +594,7 @@ The interface block will implicitly assign the cxx20 interface tag to everything
 
  * Okay, it can't be that simple. What's the catch?
 
-The catch is that types from the standard library that are used with that code are not the same types as the standard-library types used in the rest of your C++23 code. So this won't work...
+The catch is that types from the standard library that are used with that C++20 code are not the same types as the standard-library types used in the rest of your C++23 code. So this won't work...
 
 <xmp>
 #include <stdinterface>
@@ -604,7 +604,8 @@ void foo(std::vector<int> &v);
 ...
 std::vector<int> v;
 foo(v); // illformed; no conversion
-        // from std::cxx23::vector<int>& to std::cxx20::vector<int>&
+        // from interface(std::cxx23) std::vector<int>& to
+        //   interface(std::cxx20) std::vector<int>&
 </xmp>
 
 But the point here is that:
@@ -626,7 +627,7 @@ std::vector<int> x;
 interface(std::cxx23+) std::vector<int> &r = x; // okay
 
 // This vector can't do so, but sizeof(y) may be smaller than sizeof(x).
-interface() std::vector<int> y;
+interface(=) std::vector<int> y;
 
 interface(std::cxx23+) std::vector<int> &r = y; // illformed
 </xmp>
@@ -667,12 +668,12 @@ foo<interface(std::cxx23) std::vector<int>>();
 foo<std::vector<int>>(); // if cxx23 is the default, this is the same as above.
 
 // Maybe this is back to returning 24.
-foo<interface() std::vector<int>>();
+foo<interface(=) std::vector<int>>();
 
 foo<interface(std::cxx23+) std::vector<int>>(); // illformed, not a pointer/reference.
 </xmp>
 
-Note: On the design space here: it is tempting to think of objects with unresolved interface tags as real (complete) "proxy objects" with sizes and so on. There are several alternatives here that don't really work. First, we could have proxy objects as real objects that are first-class values. The problem here comes from functions that want the proxy itself by pointer, as automatic wrapping would require heap allocating the proxy, and then it would need to live for an indefinite period of time (its lifetime should be tied to that of the original object, but we have no good way to do that). An alternative would be to make the user explicitly manage the lifetime of the proxy object, but the ergonomics are not good (and the user of the interface in question might also not own the object or have any way to tie the lifetime of the newly-allocated proxy object to the original). We could say that, somewhat like references, taking the address of the proxy object yields the underlying object, so we never pass pointers to the proxy objects (they're only used for pass by value), but then the size of the proxy object would be inconsistent with the size of the storage represented by the memory at the taken address.
+Note: On the design space here: it is tempting to think of objects with unresolved interface tags as real (complete) "proxy objects" with sizes and so on. There are several alternatives here that don't really seem to work. First, we could have proxy objects as real objects that are first-class values. The problem here comes from functions that want the proxy itself by pointer, as automatic wrapping would require heap allocating the proxy, and then it would need to live for an indefinite period of time (its lifetime should be tied to that of the original object, but we have no good way to do that). An alternative would be to make the user explicitly manage the lifetime of the proxy object, but the ergonomics are not good (and the user of the interface in question might also not own the object or have any way to tie the lifetime of the newly-allocated proxy object to the original). We could say that, somewhat like references, taking the address of the proxy object yields the underlying object, so we never pass pointers to the proxy objects (they're only used for pass by value), but then the size of the proxy object would be inconsistent with the size of the storage represented by the memory at the taken address.
 
  * How can the standard library write a class that provides it's existing external interface to C++20 clients, and a new interface to C++23 clients?
 
@@ -700,18 +701,6 @@ struct point {
 
 This class provides an existing interface to C++20 clients, using its exiting ABI, while simultaneously providing an expanded interface to C++23 clients.
 
-Note that you can't do this:
-
-<xmp>
-struct thing {
-  interface(std::cxx20) {
-    void action(interface(std::cxx23) std::vector<int> &x) { } // illformed.
-    // The function of the older interface cannot take
-    // parameters (or return) types with the newer interface.
-  }
-};
-</xmp>
-
  * How can I (not the standard library) write a class that provides it's existing external interface to C++20 clients, and a new interface to C++23 clients?
 
 You do this in much the same way as the standard library, but you only need to consider cxx20 to be special as far as the ABI goes. Going forward, you likely want to decouple your interface updating strategy from that of the C++ standard.
@@ -719,8 +708,8 @@ You do this in much the same way as the standard library, but you only need to c
 <xmp>
 #include <stdinterface>
 ...
-interface v2("31f6f8ca-401a-4ddf-b6ee-2460bb3d4a3b") : std::cxx20;
-interface v3("04d10740-c706-44f5-90d3-541f52e25af8") : v2;
+interface v2 : std::cxx20;
+interface v3 : v2;
 ...
 struct point {
   interface(std::cxx20) {
@@ -747,8 +736,8 @@ struct point {
 In that case, you can ignore the standard tags and just add interface declarations as appropriate.
 
 <xmp>
-interface v1("31f6f8ca-401a-4ddf-b6ee-2460bb3d4a3b");
-interface v2("04d10740-c706-44f5-90d3-541f52e25af8") : v1;
+interface v1;
+interface v2 : v1;
 ...
 struct point {
   interface(v1) {
@@ -775,62 +764,51 @@ struct point {
 Then you'll want to take these unresolved-interface-qualified types.
 
 <xmp>
-void foo(interface(std::cxx23+) std::vector<int> &x) interface(std::cxx23) {
+void foo(interface(std::cxx23+) std::vector<int> &x) {
  // We can be called with a C++23 vector, or a C++26 vector, or any later version.
 }
 </xmp>
 
-Note that there's a significant difference is design intent here....
+ODR and Definition Flexibility {#odr}
+===========
 
+There are some choices around how we adjust our ODR rules and these have design implications for the feature. We will need to adjust our ODR rules to allow for multiple definitions of types which are not exactly the same, but rather, one definition includes entities with interface qualifiers not found in the other.
 
+We might also decide to allow reordering of member declarations within a type while deciding equivalence. Allowing for this kind of reordering may require a more-resilient indexing scheme into the type metadata (e.g., instead of a fixed-index vtable, a hash lookup or binary search might be needed to find member offsets).
 
-Now here's the interesting case...
-
-<xmp>
-struct thing {
-  interface(std::cxx
-}
-
-interface(std::cxx23) {
-  struct 
-}
-</xmp>
+We might also decide to allow for renaming of things. This could be done by allowing for the association of a UUID (used, e.g., for mangling instead of the name itself) with entities that are allowed to be renamed.
 
 Proposal {#prop}
 ===========
 
 ## Interface Tags ## {#itags}
 
-First, this proposal introduces the concept of an interface tag. An interface tag identifies an interface version and has two properties:
+First, this proposal introduces the concept of an interface tag. An interface tag identifies an interface version and has one or two properties:
 
  1. A name. This name has the usual properties of names in C++: it has a scope, it may be qualified, and so on.
- 2. A unique identifier. This is specified as a string specifying a UUID.
-
-In addition, an interface may specify an interface from which it inherits. Only single inheritance is permitted (i.e., interface versions have only a linear history).
-
-While an interface has a name, and that name is used during name lookup, an interface is identified only by its UUID. This means that it's perfectly legal for multiple interfaces (with different names) to have the same UUID. When performing name lookup, interfaces with the same UUID are considered the same.
-
-Note: This is to allow users to change the names used for interface tags over time.
+ 2. Optionally, a parent. An interface may specify an interface from which it inherits. Only single inheritance is permitted (i.e., interface versions have only a linear history).
 
 <xmp>
 // Declares an interface tag:
-interface v1("31f6f8ca-401a-4ddf-b6ee-2460bb3d4a3b");
+interface v1;
 // Declares an interface tag that inherits from the one above.
-interface v2("04d10740-c706-44f5-90d3-541f52e25af8") : v1;
+interface v2 : v1;
 </xmp>
 
 The intent of this proposal is that each version of the standard will define an interface tag associated with that version of the standard, along with the tags defined in previous revisions of the standard, with an appropriate inheritance structure. For example, we might have:
 
 <xmp>
-interface cxx20("506b620f-e233-4359-a4d3-57c9311e9206");
-interface cxx23("3fae4804-279c-4c8f-8bdf-4ad0dde2e587") : cxx20;
+namespace std {
+
+  interface cxx20;
+  interface cxx23 : cxx20;
+
+}
 </xmp>
 
-Issue: The UUID is a specification of a 128-bit unsigned integer, and other ways to write an 128-bit integer constant might also be permitted.
+Note: It is expected that implementations will treat the cxx20 tag as a special case for the purpose of maintaining ABI compatibility with code compiled using tools complying with previous revisions of the C++ standard. Specifically, entities with the cxx20 interface tag may follow different name-mangling rules than other entities.
 
-Note: It is expected that implementations will treat the cxx20 tag as a special case for the purpose of maintaining ABI compatibility with code compiled using tools complying with previous revisions of the C++ standard.
-
-Issue: Can interfaces themselves be template arguments and, thus, be dependent? Can the UUID used in the declaration be dependent or constexpr computed? 
+Issue: Can interfaces themselves be template arguments and, thus, be dependent?
 
 ## Interface Blocks ## {#blks}
 
@@ -860,9 +838,9 @@ namespace foo {
 }
 </xmp>
 
-Note: Formally, interface blocks do not introduce new scopes, but are merely syntactic sugar for adding the interface qualifier to everything relevant inside the curly braces. This might seem strange, but in context this makes sense because the interface qualifier itself has a name-scoping effect, and so from the programmer's perspective, the construct should have the behavior implied by the braces.
+Note: Formally, interface blocks do not introduce new scopes, but are merely syntactic sugar for adding the interface qualifier to everything relevant inside the curly braces. This might seem strange, but in context this makes sense because the interface qualifier itself has a name-scoping-like effect, and so from the programmer's perspective, the construct should have the behavior implied by the braces.
 
-An interface block with an "default" interface restores use of the default interface.
+An interface block with an empty interface restores use of the default interface.
 
 ## Interface Qualifiers ## {#quals}
 
@@ -877,24 +855,18 @@ interface(v1)
 // A qualifier for the interface tag v1 or any interface inheriting from it.
 // This is called an unresolved interface.
 interface(v1+)
+// A qualifier for the interface tag v1 that cannot be used with objects
+// with unresolved interfaces. This is called a raw interface.
+interface(v1=)
 </xmp>
 
-These qualifiers can appear on functions, variables, and so on. Interface qualifiers have a dual affect:
-
- 1. They become part of the type. This has all of the usual properties (e.g., they can be used for overloading, template specialization, and so on).
- 2. They become part of the name of the declared entities. This works in much the same way as inline namespaces, where a namespace with the name of the interface tag encloses the declared entity. Thus, the interface tag is used as a kind of namespace name, but the name also becomes available in the enclosing scope.
-
-Note: Because interface names, when appearing in qualified names, are compared by UUID and not by name, there are aspects that depart from usual namespace names, but the effect should be largely familiar to programmers.
-
-Note: It is expected that implementations will use the UUID of the interface when performing name mangling instead of the name used for any associated interface tag (except for the special cxx20 tag, which is likely has it's own legacy mangling scheme).
-
-Note: Unresolved interface names are not available as identifiers that can be used to form qualified names. This should be okay because the reason one might use the interface tag as part of a qualified name is to refer to some specific entity, but unresolved interfaces don't contain specific entities.
+These qualifiers can appear on functions, variables, and so on. Interface qualifiers become part of the type. This has all of the usual properties (e.g., they can be used for overloading, template specialization, and so on).
 
 There is an implementation-defined default interface tag applied to all declarations and definitions. This default must be the same for all entities within a module.
 
 Note: This is to allow the implementation to import modules previously compiled under previous revisions of the C++ standard and have entities in those modules have the "older" interface tag.
 
-An interface qualifier with an "default" interface tag specifies that the default interface is to be used.
+An interface qualifier with an empty interface tag specifies that the default interface is to be used.
 
 When performing name lookup, there might be multiple available names in a scope that only differ by their interface tag. In this case, names with an interface tag matching those of the object (for member access), or parameters (analogous to ADL) for any calls, are preferred.
 
@@ -910,7 +882,9 @@ Entities within the same scope with the same name and type (ignoring interface t
 
 Note: The above rules are intended to ensure that interface inheritance is strictly additive (although additive in this context does include the ability to explicitly make names unavailable by deleting them) and storage sharing takes place as needed.
 
-Interface qualifiers on fundamental types are ignored. The implementation may define extended fundamental types on which interface qualifiers are ignored. Collectively, these are called interface oblivious types. The standard library shall provide a type trait that can be used to determine if interface qualifiers will be ignored for a given base type.
+Interface qualifiers on fundamental types are ignored. The implementation may define extended fundamental types on which interface qualifiers are ignored. Collectively, these are called interface oblivious types.
+
+Note: The standard library provides a type trait that can be used to determine if interface qualifiers will be ignored for a given base type.
 
 ### Unresolved Interfaces ### {#qualsur}
 
@@ -918,7 +892,7 @@ Types with unresolved interfaces are distinct from types with resolved interface
 
 Note: dynamic_cast, and other associated mechanisms, can be used to determine if an object with a given type can be converted to another type (perhaps differing only in the interface qualifier).
 
-Variables with types with unresolved interfaces may hold values of the same base type and any interface tag that (transitively) inherits from the provided base interface or the base interface itself. This requires, however, that the type has an interface tag that has been explicitly provided and not empty (either via a qualifier or an interface block, not just by the "default" interface tag or otherwise by the implementation default).
+Variables with types with unresolved interfaces may hold values of the same base type and any interface tag that (transitively) inherits from the provided base interface or the base interface itself. This requires, however, that the type has an interface tag that has been explicitly provided and not raw (either via a qualifier or an interface block, not just by the empty interface tag or otherwise by the implementation default).
 
 Note: The restriction to types with explicitly-provided interface tags is needed to permit types to omit their hidden metadata fields associated with providing interface support.
 
@@ -936,8 +910,8 @@ All interface-public members can be accessed from a type with an unresolved inte
 
 <xmp>
 namespace std {
-  interface cxx20("506b620f-e233-4359-a4d3-57c9311e9206");
-  interface cxx23("3fae4804-279c-4c8f-8bdf-4ad0dde2e587") : cxx20;
+  interface cxx20;
+  interface cxx23 : cxx20;
 
 
   template<class T>
@@ -954,6 +928,8 @@ Issue: Other traits should be provided. A traits to strip off the interface qual
 
 Acknowledgments {#ack}
 =======
+
+I thank Nevin Liber for providing feedback.
 
 This research was supported by the Exascale Computing Project (17-SC-20-SC), a collaborative effort of two U.S. Department of Energy organizations (Office of Science and the National Nuclear Security Administration) responsible for the planning and preparation of a capable exascale ecosystem, including software, applications, hardware, advanced system engineering, and early testbed platforms, in support of the nation's exascale computing imperative. Additionally, this research used resources of the Argonne Leadership Computing Facility, which is a DOE Office of Science User Facility supported under Contract DE-AC02-06CH11357.
 
