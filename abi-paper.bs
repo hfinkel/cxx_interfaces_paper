@@ -1,7 +1,7 @@
 <pre class='metadata'>
 Title: Extending the Type System to Provide API and ABI Flexibility
 Shortname: D2123
-Revision: 0a
+Revision: 0b
 Audience: EWGI
 Status: P
 Group: WG21
