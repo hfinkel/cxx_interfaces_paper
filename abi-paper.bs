@@ -9,16 +9,16 @@ URL: http://wg21.link/p2123
 Editor: Hal Finkel, Argonne National Laboratory, hfinkel@anl.gov
 Editor: Tom Scogland, Lawrence Livermore National Laboratory, scogland1@llnl.gov
 Abstract: For C++, in some collective sense, our community wants the flexibility to change the implementation details and interfaces of types in order to realize performance benefits and otherwise enhance functionality while simultaneously wanting the interface stability necessary to compose software from compiled code created by multiple entities over long time spans. C++ does not currently provide the language-level tools necessary in order to express different points in this flexibility vs. stability space, and this makes it increasingly difficult to evolve the language and its standard library in useful directions. In this paper, we'll explore requirements and a potential solution to this problem.
-Date: 2020-02-15
+Date: 2020-03-02
 Markup Shorthands: markdown yes
 </pre>
 
 Introduction {#intro}
 ===========
 
-The Application Binary Interface (ABI) in C++ is the architecture-specific protocol, including calling conventions and structure-layout rules, used on a system in order to support separate compilation of C++ code and the composition of programs from the output of those compilation tasks (often in the form of object files, static libraries, and/or shared libraries). In Prague, the committee considered the question of whether or not to take an "ABI break" for the C++23 revision of the standard. While the C++ specification does not specify an ABI, or ABI requirements, directly, our ability to evolve the standard requires consideration of ABI compatibility constraints imposed by the the design of existing shipping C++ ABIs. The results, unfortunately, we're fairly inconclusive. A reasonable interpretation of the poll results is that the committee is willing to consider an ABI break at some point in the future, but not right now, and that while performance is an important objective of C++, stability is also important. Moreover, it is unclear exactly what change to facts on the ground would lead to a consensus shift in this regard. This proposal seeks to change the facts on the ground by providing additional language facilities to manage interface stability, including between different revisions of the standard, over time.
+The Application Binary Interface (ABI) in C++ is the architecture-specific protocol, including calling conventions and structure-layout rules, used on a system in order to support separate compilation of C++ code and the composition of programs from the output of those compilation tasks (often in the form of object files, static libraries, and/or shared libraries). In Prague, the committee considered the question of whether or not to take an "ABI break" for the C++23 revision of the standard. While the C++ specification does not specify an ABI, or ABI requirements, directly, our ability to evolve the standard requires consideration of ABI compatibility constraints imposed by the the design of existing shipping C++ ABIs. The results, unfortunately, were fairly inconclusive. A reasonable interpretation of the poll results is that the committee is willing to consider an ABI break at some point in the future, but not right now, and that while performance is an important objective of C++, stability is also important. Moreover, it is unclear exactly what change to facts on the ground would lead to a consensus shift in this regard. This proposal seeks to change the facts on the ground by providing additional language facilities to manage interface stability, including between different revisions of the standard, over time.
 
-Would adopting this proposal essentially imply an ABI break? Yes an no. It's more complicated than that. By turning ABIs and interfaces into first-class facets of the language, code written may, by default, be ABI-incompaible with older C++ code. However, there's an explicit and natural way to use this older code (i.e., to explicitly have access to, and provide new functionality following, the older ABI). At this one transition point, it may be the case that wrapper code needs to be written in between C++20 and C++23 components to allow for the most-ergonomic usage, but that can be done completely within the context of standard C++, and the new language facilities prevent the needs for this wrapper creation to happen again in the future. In short, perhaps we can have our cake and eat it too.
+Would adopting this proposal essentially imply an ABI break? Yes and no. It's more complicated than that. By turning ABIs and interfaces into first-class facets of the language, code written may, by default, be ABI-incompaible with older C++ code. However, there's an explicit and natural way to use this older code (i.e., to explicitly have access to, and provide new functionality following, the older ABI). This allows C++ programmers to manage ABI transitions and explicitly choose where and how to incur any associated performance penalties.
 
 Note that there is a lot of prior work in this general area, both in the generalized C/C++ ecosystem, and in other programming languages. See, for example, Swift's module stability / library evolution model and Microsoft's Component Object Model (COM).
 
@@ -33,8 +33,171 @@ Implementation {#impl}
 
 This proposal has not been implemented.
 
+What Are We Talking About? {#what}
+===========
+
+Before we discuss how we might design language-level facilities to deal with ABI transitions, let's discuss ABI constraints in more detail. The C++ specification does not specify an ABI, or ABI requirements, directly, but there are common implementation techniques that affect how we can evolve the specification, and the implementations themselves, while retaining the ability for a single implementation to serve both code compiled in the context of newer and older C++ standards.
+
+Many of these implementation techniques are designed around supporting C++'s separate-complication model: An application can be composed, at compile time, from multiple independently-compiled translation units. On many systems, in addition, an application can be composed, during program execution, from multiple independently-compiled translation units linked in the form of shared libraries. Some of these shared libraries are loaded during application startup, and sometimes, the application specifically directs the loading of additional shared libraries serving as "plugins" or similar.
+
+C++ allows some kinds of entities to be defined in multiple translation units in a program so long as their definitions are the same. This leads to our well-known One-Definition Rule (ODR). At an implementation level, to support separate compilation, this means that the implementations of these inline-linkage entities are often emitted multiple times (e.g., into multiple object files, shared libraries) and the linker and/or dynamic loader somehow picks one of these implementation instances to use for a particular program execution. For a conforming program, none of this should be visible. It's important to note that we're not just talking about entities that have an explicit manifestation in the C++ language, but also things, such as virtual-function tables, that are implicitly defined by the C++ code.
+
+In practice, ABIs are composed from different architecture/system-specified pieces, including:
+ * The C ABI: structure layouts, calling conventions, TLS implementation details, and so on. Might only apply to extern "C" entities, but is often used for many C++ entities as well.
+ * C++ name-mangling rules (i.e., how to encode the overload-identifying name of a function as a symbol name).
+ * The representation of C++ primitives (e.g., member pointers).
+ * The layout of aggregates that don't have direct C analogues (e.g., have base classes, virtual functions).
+ * The layout of virtual-function tables, RTTI information, and other implementation-internal metadata.
+ * The method used to implement exception handling.
+
+When discussing this issue, we sometimes end up discussing both:
+ * The possibility of changing existing types in a way that is ABI-incompatible with existing implementations of those types.
+ * The possibility of changing/extending the ABI itself in order to improve functionality.
+
+What kinds of changes to a type are ABI-incompatible in this sense? These include:
+ * Changing the size of the type, the layout of the type (e.g., the order of the members, alignment, adding `[[no_unique_address]]`, modifying base classes, adding the first virtual function).
+ * Changing the size or contents of the virtual-function table (e.g., changing the order in which virtual functions are defined, adding a new virtual function).
+ * Changing the return type of a function.
+
+There are some ABI-changing modifications one might make to a class that are not necessarily ABI incompatible, such as changing the type of a function, because an implementation might use the "provide both the new and old symbol" technique to simultaneously serve both old and new clients.
+
+It is also, of course, possible to make incompatible API (i.e., source-level) changes to a type. For example, adding new function overloads, removing a function, and so on.
+
+Changes to the ABI itself, such as changing the calling convention (e.g., how many registers are used for parameter passing, which register holds the `this` pointer), are also part of the conversation around ABI changes and might be something a facility for dealing with ABI changes wishes to address.
+
+It is also important to be clear about whether we intend only to allow different, ABI-incompatible types of the same name to exist in the same program, which is currently often impossible because of inline-linkage definitions and other shared data (e.g., virtual-function tables), or whether we intend to allow for some translation unit to use both of these types simultaneously. It has been suggested that we need to only handle the former case and not the latter. While this may be a helpful step in the right direction, it is not clearly sufficient because this restricts us to a programming model where different parts of the application must use "C" interfaces to communicate across ABI boundaries, including using "C" types to marshal all data across these boundaries (instead of using the C++ types directly). 
+
+What Are We Not Talking About? {#whatnot}
+===========
+
+We are not talking about changes to the semantics of existing types. If we want to make an existing function do something different, refrain from doing something, or do something more, with respect to other existing functions or public data members, this kind of ABI-change-handling facility may not help us. These are not ABI changes, but changes in semantics, and semantics changes should often change the names of types regardless of any other considerations.
+
+Thus, while a proposal to handle ABI changes can potentially deal with some kinds of API-level changes, such as removing a function, it cannot, in general, deal with associated semantic changes, such as the ability for the type to correctly implement the removed function.
+
+On Costs {#costs}
+===========
+
+Dealing with multiple implementations of library types nearly always imposes some kind of cost. Language-level facilities in this space may, and likely should, provide the programmer with a way to incur / trade off these costs in a way that makes sense for each particular application. A programmer might trade off the costs of:
+ * Indirection (i.e., performance overhead associated with dynamically-resolved abstraction)
+ * Specialization (i.e., overheads associated with generating multiple specializatons)
+ * Copying (i.e., the overheads associated with explicitly transitioning between data structures by copying data between one and the other)
+ * Technical dept (i.e., only using older types in the application, thus preventing the use of newer features)
+ * Ecosystem isolation (i.e., only using the newest types, perhaps preventing integration with other libraries and services)
+
+Some Past Experience {#paste}
+===========
+
+Some C++ standard-library implementations, such as libc++, use C++ inline namespaces and these may succeed at providing a partial strategy for dealing with ABI/API transitions. `std::vector` is really `std::__1::vector`, and so on. With all of the usual caveats about return types not being part of the name mangling on some systems, this can provide unique symbol names when using types from different (inline) namespaces. However:
+ * The inline namespace technique is not viral: it affects only direct uses of the standard-library types. User types that use standard-library types are not automatically tied to the same versioning scheme, and so, the inline namespace technique does not help user-defined types in the same way.
+ * On some systems, it doesn't even help standard-library types if they're used only as return types.
+ * It's not clear how we might use this technique to manage ABI transitions directly.
+
+On this last point, it is important to consider another relevant experience that we have with type aliases (e.g., intmax_t). One straightforward suggestion for managing API transitions is to use a new namespace for each revision of the standard. This may work, but leads to a proliferation of vocabulary types (i.e., if std2 would be bad, this would be std2 and std3 and std4 and so on). A natural suggestion is to allow some of the types from the newer namespaces to be aliases for the types in the older namespaces. However, if this aliasing is implementation defined, or unspecified, it's very difficult to create complete, unambiguous overload sets covering all of these types:
+
+<xmp>
+void foo(std::cxx20::vector<int> &x);
+
+// Is this needed or ambiguous with the definition above?
+void foo(std::cxx23::vector<int> &x);
+</xmp>
+
+So for this to work well, we need some adjusted set of rules for overload resolution.
+
+An alternative technique, used by GCC to help manage the C++11 std::string transition, is to introduce "viral" ABI tags. The idea is that these tags affect the mangling, but also affect the mangling of types that use the tagged types. It's unclear what should happen if multiple tags are used, but for a single possible tag the high-level description of the behavior seems reasonably simple:
+
+<xmp>
+From the GCC manual:
+
+abi_tag ("tag", ...)
+
+The abi_tag attribute can be applied to a function, variable, or class
+declaration. It modifies the mangled name of the entity to incorporate the tag
+name, in order to distinguish the function or class from an earlier version
+with a different ABI; perhaps the class has changed size, or the function has a
+different return type that is not encoded in the mangled name.
+
+The attribute can also be applied to an inline namespace, but does not affect
+the mangled name of the namespace; in this case it is only used for -Wabi-tag
+warnings and automatic tagging of functions and variables. Tagging inline
+namespaces is generally preferable to tagging individual declarations, but the
+latter is sometimes necessary, such as when only certain members of a class
+need to be tagged.
+
+The argument can be a list of strings of arbitrary length. The strings are
+sorted on output, so the order of the list is unimportant.
+
+A redeclaration of an entity must not add new ABI tags, since doing so would
+change the mangled name.
+
+The ABI tags apply to a name, so all instantiations and specializations of a
+template have the same tags. The attribute will be ignored if applied to an
+explicit specialization or instantiation.
+
+The -Wabi-tag flag enables a warning about a class which does not have all the
+ABI tags used by its subobjects and virtual functions; for users with code that
+needs to coexist with an earlier ABI, using this option can help to find all
+affected types that need to be tagged.
+
+When a type involving an ABI tag is used as the type of a variable or return
+type of a function where that tag is not already present in the signature of
+the function, the tag is automatically applied to the variable or function.
+-Wabi-tag also warns about this situation; this warning can be avoided by
+explicitly tagging the variable or function or moving it into a tagged inline
+namespace.
+</xmp>
+
+A couple of notes: First, care is required that forward-declared types are properly annotated:
+
+<xmp>
+struct A;
+
+// We need to mangle the name of A here into the name of the function, so we
+// need to know if it has an ABI tag now.
+void f(std::unique_ptr<A>);
+</xmp>
+
+Second, to maintain ODR-provided invariants, we may also need to tag inline-linkage entities based everything used in their definitions, not just those types that appear on the interface. In this example (provided by Richard Smith):
+
+<xmp>
+inline const char *getThing() {
+  static std::string thing = getenv("thing");
+  return thing.c_str();
+}
+</xmp>
+
+even if we mangle the name of the static variable using the ABI identifier, it's true that the C++23-compiled getThing will return a different pointer than the C++20-compiled getThing (and, if we don't always select a consistent implementation of the function matching the language mode of the caller, a different pointer might be returned depending on whether or not any particular call is inlined).
+
+This tag-based mechanism does not address the problem of allowing the user to name both types in the same translation unit.
+
+Just Recompile! {#jrc}
+===========
+
+We note that some users of C++ can simply recompile all of their code as desired, and thus, these kinds of ABI considerations are not relevant to them. Not all users can, however. Some users can recompile their code as desired, but depend on system libraries and/or system interfaces provided only using some older ABI (e.g. the BeOS API, which is native C++, was like this). Some users can recompile their code but depend on third-party libraries that they cannot recompile. Some users can recompile their code, but their code is a plugin to a third-party application with a fixed ABI. Some users can recompile their code, but their code must load plugins that use the older ABI. Some users can recompile their code, but doing so along with a language-version upgrade is a slow, expensive process if it must happen synchronously across the entire organization.
+
+In short, many users can recompile their code. If they couldn't, they don't care about using the latest C++ features. However, adoption will be increased if users can recompile their code to use the latest C++ without requiring the same for all transitive dependencies.
+
+Does This Help With ... {#helpw}
+===========
+
+People have asked whether this proposal would help with some specific use cases that people have had in mind, including:
+
+ * std::regex
+
+Whether or not this might help with std::regex depends greatly on how we might want to change the specification and/or implementations. Presumably, we would want a better (more efficient) way to handle localized character classification, better algorithms and automata optimizations, and so on. We might also need to significantly change the interface to accomplish these goals, however, in which case none of this is particularly relevant (because we'll need to change much of the code using the class regardless and/or just name the new version something else). However, if we restrict this problem to looking only at the problem of updating the algorithms in inline-linkage functions, and potentially, data-structure changes that can be made in a purely-additive way, then yes, this proposal should help that kind of transition.
+
+ * std::unordered_map
+
+This, again, is going to depend on what kinds of changes we desire to unordered_map. If we're trying to allow more implementation freedom, for example, to allow for different kinds of open-addressing strategies, by loosening our iterator-stability guarantees, then that's a semantic change that cannot necessarily be addressed by the proposed facility. If, on the other hand, we're talking about something like changing an implementation from using power-of-two bucket counts to prime bucket counts (or Fibonacci or whatever), then the answer is: maybe. It depends on how deeply the current choice is embedded in the design of the current data structure. If the implementation works with any bucket sizes, it's just that we want to change how the defaults are selected, then this will help. If we can't provide a new implementation that will also work with inlined member functions of the old implementation, then this may not help.
+
+ * std::unique_ptr
+
+An interesting case because, if the primary desire is to effectively modify the calling convention to prevent passing a pointer to the pointer, this requires a kind of semantic change. For background, see CppCon 2019 talk by Chandler Carruth: "There Are No Zero-cost Abstractions". Because unique_ptr has a non-trivial destructor (and constructor) it is passed using the general convention for non-trivial aggregates, thus by pointer. This is inefficient for this kind of wrapper type but, for ABIs where the temporaries are constructed in the caller, ensures a unique value of the this pointer in the constructor and destructor. We could change this, but that would require making a new kind of object (maybe by leveraging our `[[no_unique_address]]` attribute in a new way). In any case, this proposed facility would help with this transition, as would any facility allowing the implementation to give a new mangling scheme to the unique_ptr with these new semantics.
+
+
 Requirements {#req}
 ===========
+
+Some requirements for a facility to help ABI transitions:
 
  1. C++ must default to providing flexibility over interface stability. If the programmer does nothing explicit, then they should get the highest possible performance (relative to that provided by other aspects of this proposal). This includes uses of standard-library types and functions.
  2. C++ must provide a way for types to provide interfaces that prioritize stability over flexibility. This must allow code written using a newer version of C++ to call functions in code written in an ABI-incompatible older version of C++, and code written in an older version of C++ to call functions in code written in an ABI-incompatible newer version of C++. It must be possible to implement this feature such that the ABI of pre-C++-23 code can be selected as required.
@@ -938,7 +1101,7 @@ Issue: Other traits should be provided. A traits to strip off the interface qual
 Acknowledgments {#ack}
 =======
 
-We thank Nevin Liber, Corentin Jabot, and Niall Douglas for providing feedback.
+We thank Nevin Liber, Corentin Jabot, Niall Douglas, Bjarne Stroustrup, Arthur O'Dwyer, Tom Honermann, Gabriel Dos Reis, Bryce Adelstein Lelbach, Richard Smith, Peter Dimov, Peter Bindels, Nathan Myers, Mathias Stearn, Caleb Sunstrum, Stephan T. Lavavej, Ben Craig, Michael Hava, Steve Downey, Davis Herring, Attila Fehér, David Stone, Arvid Norberg, Tony Van Eerd, Bronek Kozicki, and Jon Chesterfield for providing feedback.
 
 This research was supported by the Exascale Computing Project (17-SC-20-SC), a collaborative effort of two U.S. Department of Energy organizations (Office of Science and the National Nuclear Security Administration) responsible for the planning and preparation of a capable exascale ecosystem, including software, applications, hardware, advanced system engineering, and early testbed platforms, in support of the nation's exascale computing imperative. Additionally, this research used resources of the Argonne Leadership Computing Facility, which is a DOE Office of Science User Facility supported under Contract DE-AC02-06CH11357.
 
